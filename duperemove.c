@@ -33,6 +33,9 @@
 #include <getopt.h>
 #include <inttypes.h>
 #include <linux/magic.h>
+#include <assert.h>
+
+#include <glib.h>
 
 #include "rbtree.h"
 #include "list.h"
@@ -53,9 +56,7 @@ int verbose = 0, debug = 0;
 #define MAX_BLOCKSIZE	(1024*1024)
 #define DEFAULT_BLOCKSIZE	(128*1024)
 static unsigned int blocksize = DEFAULT_BLOCKSIZE;
-static char *buf = NULL;
 
-static unsigned char digest[DIGEST_LEN_MAX] = { 0, };
 static char path[PATH_MAX] = { 0, };
 char *pathp = path;
 char *path_max = &path[PATH_MAX - 1];
@@ -356,19 +357,28 @@ static void dedupe_results(struct results_tree *res)
 	       pretty_size(kern_bytes), pretty_size(fiemap_bytes));
 }
 
-static int csum_whole_file(struct hash_tree *tree, struct filerec *file)
-{
-	int ret;
-	ssize_t bytes, bytes_read;
-	uint64_t off;
+typedef struct csum_thread_args {
+	volatile uint64_t *offp;
+	struct hash_tree *tree;
 
-	printf("csum: %s\n", file->filename);
+	// Protects both tree and offp
+	GMutex tree_mutex;
 
-	ret = filerec_open(file, 0);
-	if (ret)
-		return ret;
+	struct filerec *file;
+} csum_thread_args;
 
-	ret = off = bytes = 0;
+static void *csum_whole_file_thread(csum_thread_args *args) {
+	struct hash_tree *tree = args->tree;
+	volatile uint64_t *offp = args->offp;
+	GMutex *tree_mutex = &args->tree_mutex;
+	struct filerec *file = args->file;
+
+	char *buf = malloc(blocksize);
+	assert(buf != NULL);
+	unsigned char *digest = malloc(DIGEST_LEN_MAX);
+	assert(digest != NULL);
+	ssize_t bytes = 0, bytes_read = 0;
+	int ret = 0;
 
 	while (1) {
 		bytes_read = read(file->fd, buf+bytes, blocksize-bytes);
@@ -376,7 +386,7 @@ static int csum_whole_file(struct hash_tree *tree, struct filerec *file)
 			ret = errno;
 			fprintf(stderr, "Unable to read file %s: %s\n",
 				file->filename, strerror(ret));
-			break;
+			goto out;
 		}
 
 		/* Handle EOF */
@@ -386,22 +396,81 @@ static int csum_whole_file(struct hash_tree *tree, struct filerec *file)
 		bytes += bytes_read;
 
 		/* Handle partial read */
-		if (bytes_read > 0 && bytes < blocksize)
+		if (bytes_read > 0 && bytes < blocksize) {
+			g_mutex_lock(tree_mutex);
+			*offp += bytes;
+			g_mutex_unlock(tree_mutex);
 			continue;
+		}
 
 		/* Is this necessary? */
 		memset(digest, 0, DIGEST_LEN_MAX);
 
 		checksum_block(buf, bytes, digest);
 
-		ret = insert_hashed_block(tree, digest, file, off);
+		g_mutex_lock(tree_mutex);
+		*offp += bytes;
+		ret = insert_hashed_block(tree, digest, file, *offp);
+		g_mutex_unlock(tree_mutex);
 		if (ret)
 			break;
 
-		off += bytes;
 		bytes = 0;
 	}
 
+out:
+	free(buf);
+	free(digest);
+	g_mutex_clear(tree_mutex);
+	free(args);
+	return GINT_TO_POINTER(ret);
+}
+
+static int csum_whole_file(struct hash_tree *tree, struct filerec *file)
+{
+	int ret;
+
+	printf("csum: %s\n", file->filename);
+
+	ret = filerec_open(file, 0);
+	if (ret)
+		return ret;
+
+	long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
+	if (nprocs == -1) {
+		ret = errno;
+		fprintf(
+			stderr,
+			"Unable to determine number of processors: %s\n",
+			strerror(errno));
+		goto out;
+	}
+
+	volatile uint64_t off = 0;
+	GThread **threads = calloc(nprocs, sizeof(GThread *));
+	assert(threads);
+	long i;
+	for (i = 0; i < nprocs; i++) {
+		// Will be freed by the thread.
+		csum_thread_args *args = malloc(sizeof(csum_thread_args));
+		assert(args);
+		args->tree = tree;
+		args->file = file;
+		g_mutex_init(&args->tree_mutex);
+		args->offp = &off;
+		threads[i] = g_thread_new(
+			"csum_whole_file",
+			(GThreadFunc) csum_whole_file_thread,
+			args);
+	}
+
+	for (i = 0; i < nprocs; i++) {
+		ret = GPOINTER_TO_INT(g_thread_join(threads[i]));
+		if (ret != 0) goto out;
+	}
+
+out:
+	free(threads);
 	filerec_close(file);
 
 	return ret;
@@ -910,10 +979,6 @@ int main(int argc, char **argv)
 	}
 
 	printf("Using %uK blocks\n", blocksize/1024);
-
-	buf = malloc(blocksize);
-	if (!buf)
-		return ENOMEM;
 
 	if (!read_hashes) {
 		ret = populate_hash_tree(&tree);
